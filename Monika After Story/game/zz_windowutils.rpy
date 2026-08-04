@@ -150,6 +150,34 @@ init python in mas_windowutils:
             pass
         return ""
 
+    def __getActiveWindowTitle_KWin():
+        """
+        Gets the active window title on KDE Plasma / KWin (Wayland or X11).
+
+        NOTE: requires the `kdotool` utility to be installed (an xdotool-like
+        tool that talks to KWin's D-Bus scripting interface). Without it this
+        returns "" and callers fall through to XWayland.
+        """
+        try:
+            wid = subprocess.check_output(
+                ["kdotool", "getactivewindow"],
+                stderr=subprocess.STDOUT
+            ).strip()
+            if not wid:
+                return ""
+            title = subprocess.check_output(
+                ["kdotool", "getwindowname", wid],
+                stderr=subprocess.STDOUT
+            ).strip()
+            #Decode to unicode so regex matching in the windowreact db works
+            try:
+                return unicode(title, "utf-8")
+            except Exception:
+                return title
+        except Exception:
+            pass
+        return ""
+
     def __detectWaylandCompositor():
         """
         Detects the Wayland compositor and returns the matching active-window
@@ -169,6 +197,11 @@ init python in mas_windowutils:
         if "sway" in desktop or os.environ.get("SWAYSOCK"):
             if _haveBin("swaymsg"):
                 return __getActiveWindowTitle_Sway
+
+        #KDE Plasma / KWin via kdotool
+        if "kde" in desktop or "plasma" in desktop or "kwin" in desktop:
+            if _haveBin("kdotool"):
+                return __getActiveWindowTitle_KWin
 
         #GNOME: only if the focused-window D-Bus extension is reachable
         if "gnome" in desktop and _haveBin("gdbus"):
