@@ -38,6 +38,8 @@ init -10 python in mas_windowreacts:
 
 init python in mas_windowutils:
     import os
+    import json
+    import subprocess
 
     import store
     from store import mas_utils
@@ -45,6 +47,161 @@ init python in mas_windowutils:
 
     # The window object, used on Linux systems, otherwise always None
     MAS_WINDOW = None
+
+    # Active-window getter for Wayland compositors. None means no
+    # compositor-specific getter is available (fall back to X11/XWayland).
+    __active_window_getter = None
+    #Helpers for Wayland active-window detection. Wayland has no
+    #compositor-independent API for reading the active window, so we detect the
+    #compositor and pick a case-by-case getter. Hyprland and Sway cover the
+    #majority of cases; GNOME is handled via the "Focused Window D-Bus" shell
+    #extension when present, otherwise it falls through.
+    def _haveBin(binary):
+        """
+        Checks if a binary is available on PATH (Python 2 safe, no shutil.which)
+        """
+        for path in os.environ.get("PATH", "").split(os.pathsep):
+            full = os.path.join(path, binary)
+            if os.path.isfile(full) and os.access(full, os.X_OK):
+                return True
+        return False
+
+    def _findFocusedNode(node):
+        """
+        Recursively finds the focused window node in a sway/i3 tree.
+        """
+        if node.get("focused"):
+            return node
+        for child in node.get("nodes", []):
+            result = _findFocusedNode(child)
+            if result is not None:
+                return result
+        for child in node.get("floating_nodes", []):
+            result = _findFocusedNode(child)
+            if result is not None:
+                return result
+        return None
+
+    def __getActiveWindowTitle_Hyprland():
+        """
+        Gets the active window title via the Hyprland IPC (hyprctl).
+        """
+        try:
+            output = subprocess.check_output(
+                ["hyprctl", "-j", "activewindow"],
+                stderr=subprocess.STDOUT
+            )
+            data = json.loads(output)
+            if data:
+                return data.get("title", "")
+        except Exception:
+            pass
+        return None
+
+    def __getActiveWindowTitle_Sway():
+        """
+        Gets the active window title via the Sway/i3 IPC (swaymsg).
+        """
+        try:
+            output = subprocess.check_output(
+                ["swaymsg", "-t", "get_tree"],
+                stderr=subprocess.STDOUT
+            )
+            tree = json.loads(output)
+            focused = _findFocusedNode(tree)
+            if focused:
+                return focused.get("name", "")
+        except Exception:
+            pass
+        return None
+
+    def __getActiveWindowTitle_GNOME():
+        """
+        Gets the active window title on GNOME Wayland via the "Focused Window
+        D-Bus" shell extension.
+
+        The extension exposes a GVariant tuple containing JSON, e.g.:
+            ('{"class": "...", "title": "..."}',)
+        We parse the JSON and return its "title".
+
+        NOTE: if the extension is not installed/reachable this returns "" so
+        callers fall through (e.g. to XWayland) gracefully.
+        """
+        try:
+            #subprocess.DEVNULL is Python 3 only, so use os.devnull on Python 2
+            with open(os.devnull, "w") as devnull:
+                cmd = [
+                    "gdbus", "call", "--session",
+                    "--dest", "org.gnome.Shell",
+                    "--object-path", "/org/gnome/shell/extensions/FocusedWindow",
+                    "--method", "org.gnome.shell.extensions.FocusedWindow.Get",
+                ]
+                raw = subprocess.check_output(cmd, stderr=devnull).strip()
+
+            #Strip GVariant tuple quotes: ('{...}',) -> {...}
+            if (raw.startswith("('") and raw.endswith("',)")
+                    or raw.endswith("')")):
+                start_idx = raw.find("'") + 1
+                end_idx = raw.rfind("'")
+                json_str = raw[start_idx:end_idx]
+                data = json.loads(json_str)
+                return data.get("title", "")
+        except Exception:
+            pass
+        return ""
+
+    def __detectWaylandCompositor():
+        """
+        Detects the Wayland compositor and returns the matching active-window
+        getter function, or None if none is available.
+
+        OUT:
+            callable returning an active window title (or None/""), or None
+        """
+        desktop = (os.environ.get("XDG_CURRENT_DESKTOP") or "").lower()
+
+        #Hyprland
+        if "hyprland" in desktop or os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+            if _haveBin("hyprctl"):
+                return __getActiveWindowTitle_Hyprland
+
+        #Sway (and other wlroots compositors with swaymsg)
+        if "sway" in desktop or os.environ.get("SWAYSOCK"):
+            if _haveBin("swaymsg"):
+                return __getActiveWindowTitle_Sway
+
+        #GNOME: only if the focused-window D-Bus extension is reachable
+        if "gnome" in desktop and _haveBin("gdbus"):
+            return __getActiveWindowTitle_GNOME
+
+        #Nothing compositor-specific matched
+        return None
+
+    def __initX11(context):
+        """
+        Attempts to initialize the X11 display handles. On Wayland this only
+        sees XWayland (X11) windows, used as a fallback when no compositor
+        getter applies.
+
+        IN:
+            context - string describing the session for logging
+        """
+        global __display, __root
+        __display = None
+        __root = None
+        try:
+            if os.environ.get("DISPLAY"):
+                import Xlib
+
+                from Xlib.display import Display
+                from Xlib.error import BadWindow, XError
+
+                __display = Display()
+                __root = __display.screen().root
+        except Exception as e:
+            mas_utils.mas_log.warning(
+                "Xlib unavailable on {}: {}".format(context, e)
+            )
 
     #We can only do this on windows
     if renpy.windows:
@@ -81,31 +238,34 @@ init python in mas_windowutils:
                 "win32api/win32gui failed to be imported, disabling notifications: {}".format(e)
             )
 
+
     elif renpy.linux:
         #Get session type
         session_type = os.environ.get("XDG_SESSION_TYPE")
 
-        #Wayland is not supported, disable wrs
+        #Wayland: active-window support is compositor-specific
         if session_type == "wayland":
-            store.mas_windowreacts.can_do_windowreacts = False
-            store.mas_utils.mas_log.warning("Wayland is not yet supported, disabling window reactions.")
+            __active_window_getter = __detectWaylandCompositor()
+
+            #XWayland fallback: X11 apps still expose active windows via Xlib
+            __initX11("Wayland")
+
+            if __active_window_getter is None and __display is None:
+                store.mas_windowreacts.can_do_windowreacts = False
+                store.mas_utils.mas_log.warning("Wayland active-window detection unavailable, disabling window reactions.")
+            else:
+                store.mas_utils.mas_log.debug(
+                    "Wayland window reactions enabled via: {}".format(
+                        getattr(__active_window_getter, "__name__", "xwayland")
+                    )
+                )
 
         #X11 however is fine
         elif session_type == "x11":
-            try:
-                import Xlib
+            __initX11("X11")
 
-                from Xlib.display import Display
-                from Xlib.error import BadWindow, XError
-
-                __display = Display()
-                __root = __display.screen().root
-
-            except Exception as e:
+            if __display is None:
                 store.mas_windowreacts.can_do_windowreacts = False
-                store.mas_utils.mas_log.warning(
-                    "Xlib failed to be imported, disabling window reactions: {}".format(e)
-                )
 
         else:
             store.mas_windowreacts.can_do_windowreacts = False
@@ -303,6 +463,17 @@ init python in mas_windowutils:
 
         ASSUMES: OS IS LINUX (renpy.linux)
         """
+        #Compositor-specific getter first (Hyprland/Sway/GNOME on Wayland).
+        #If it yields a title we're done; otherwise fall through to X11/XWayland.
+        if __active_window_getter is not None:
+            title = __active_window_getter()
+            if title:
+                return title
+
+        #If we have no X11 (XWayland) display, there's nothing else to try
+        if __display is None:
+            return ""
+
         NET_WM_NAME = __display.intern_atom("_NET_WM_NAME")
         active_winobj = __getActiveWindowObj_Linux()
 
