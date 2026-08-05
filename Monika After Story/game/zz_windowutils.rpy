@@ -928,7 +928,8 @@ init python:
         if active_window_handle is None:
             active_window_handle = mas_getActiveWindowHandle()
 
-        return bool(re.findall(regexp, active_window_handle))
+        #Case-insensitive so site keywords match regardless of capitalization
+        return bool(re.findall(regexp, active_window_handle, re.IGNORECASE))
 
     def mas_clearNotifs():
         """
